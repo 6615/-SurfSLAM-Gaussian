@@ -29,6 +29,7 @@ from common.shared_state import SharedState
 
 from mapping.pointcloud_registration.pointcloud_cleaner import GPUPointCloudCleaner
 from mapping.gaussian_map import GaussianMapWriter
+from mapping.gaussian_gsplat import GsplatPhotometricRefiner
 
 
 def _extract_frame_stereo_timestamp(frame_item: Frame) -> float:
@@ -189,15 +190,25 @@ class FrameTracker:
         self._gaussian_mode = str(
             self._gaussian_config.get("mode", "final")
         ).lower()
-        if self._gaussian_mode not in {"final", "online"}:
+        if self._gaussian_mode not in {"final", "online", "gsplat"}:
             raise ValueError(
-                "mapper.gaussian.mode must be either 'final' or 'online', "
+                "mapper.gaussian.mode must be 'final', 'online', or 'gsplat', "
                 f"got {self._gaussian_mode!r}"
             )
         self._gaussian_writer = GaussianMapWriter(self._gaussian_config)
         self._online_gaussian_enabled = (
-            self._map_type == "gaussian" and self._gaussian_mode == "online"
+            self._map_type == "gaussian" and self._gaussian_mode in {"online", "gsplat"}
         )
+        self._gsplat_refiner = (
+            GsplatPhotometricRefiner(self._gaussian_config)
+            if self._map_type == "gaussian" and self._gaussian_mode == "gsplat"
+            else None
+        )
+        if self._gsplat_refiner is not None and not self._gsplat_refiner.available:
+            raise RuntimeError(
+                "mapper.gaussian.mode=gsplat requires the gsplat package and CUDA. "
+                "Install requirements-gaussian.txt first."
+            )
         self._online_update_interval = max(
             1, int(self._gaussian_config.get("online_update_interval_keyframes", 5))
         )
@@ -391,14 +402,49 @@ class FrameTracker:
         if self._online_gaussian_keyframes % self._online_update_interval != 0:
             return
 
-        self._write_online_gaussian_map()
+        self._write_online_gaussian_map(
+            target_rgb=data["color_image"],
+            target_depth=data["depth_image"],
+            world_T_cam=world_T_cam,
+            intrinsics=intrinsics,
+        )
 
-    def _write_online_gaussian_map(self) -> None:
+    def _write_online_gaussian_map(
+        self,
+        target_rgb: Optional[torch.Tensor] = None,
+        target_depth: Optional[torch.Tensor] = None,
+        world_T_cam: Optional[np.ndarray] = None,
+        intrinsics: Optional[torch.Tensor] = None,
+    ) -> None:
         if not self._online_gaussian_points:
             return
 
         points = np.vstack(self._online_gaussian_points)
         colors = np.vstack(self._online_gaussian_colors)
+
+        if (
+            self._gsplat_refiner is not None
+            and target_rgb is not None
+            and world_T_cam is not None
+            and intrinsics is not None
+        ):
+            refined = self._gsplat_refiner.refine(
+                points,
+                colors,
+                world_T_cam,
+                intrinsics.detach().cpu().numpy()
+                if isinstance(intrinsics, torch.Tensor)
+                else np.asarray(intrinsics),
+                target_rgb,
+                target_depth,
+            )
+            points = refined["points"]
+            colors = refined["colors"]
+            print(
+                f"FrameTracker: gsplat photometric loss={refined['loss']} "
+                f"({refined['iterations']} iterations)"
+            )
+
         output_path = Path(self._settings.log_directory) / "reconstructed_gaussians_live.ply"
         result = self._gaussian_writer.write(output_path, points, colors)
 

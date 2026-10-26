@@ -1,0 +1,4 @@
+# Optional differentiable Gaussian rasterizer used by --gaussian_mode gsplat.
+# gsplat 1.5.3 is the PyPI release validated with this repository's
+# torch==2.4.0+cu124 environment.  Its CUDA kernels are JIT-built on first use.
+gsplat==1.5.3

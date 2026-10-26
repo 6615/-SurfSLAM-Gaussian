@@ -353,9 +353,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--gaussian_mode",
-        choices=("final", "online"),
+        choices=("final", "online", "gsplat"),
         default=None,
-        help="Gaussian output mode: final map only or provisional online snapshots.",
+        help="Gaussian mode: final, online snapshots, or gsplat photometric refinement.",
     )
 
     args = parser.parse_args()

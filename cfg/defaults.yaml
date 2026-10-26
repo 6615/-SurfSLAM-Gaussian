@@ -72,9 +72,18 @@ mapper:
   map_type: pointcloud
   gaussian:
     # final: rebuild with loop-closure optimized poses at shutdown.
-    # online: also publish a provisional map while keyframes arrive.
+    # online: publish provisional Gaussian snapshots while keyframes arrive.
+    # gsplat: online snapshots plus differentiable RGB/depth refinement.
     mode: final
     online_update_interval_keyframes: 5
+    optimization_iterations: 3
+    optimization_lr: 0.01
+    mean_learning_rate: 0.001
+    optimize_means: true
+    rgb_loss_weight: 1.0
+    depth_loss_weight: 0.1
+    max_optimize_gaussians: 50000
+    render_scale: 0.5
     voxel_size: 0.03
     max_gaussians: 500000
     opacity: 0.8
