@@ -71,6 +71,10 @@ mapper:
   # This switch does not change tracking, registration, or pose-graph behavior.
   map_type: pointcloud
   gaussian:
+    # final: rebuild with loop-closure optimized poses at shutdown.
+    # online: also publish a provisional map while keyframes arrive.
+    mode: final
+    online_update_interval_keyframes: 5
     voxel_size: 0.03
     max_gaussians: 500000
     opacity: 0.8

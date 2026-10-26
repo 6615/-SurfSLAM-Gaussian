@@ -123,6 +123,41 @@ class Tracker:
     def start_backend(self):
         self._backend.start()
 
+    def _attach_provisional_pose(self, keyframe: Frame) -> None:
+        """Attach the latest pose estimate for optional online mapping.
+
+        The pose graph may revise this estimate after registration or loop
+        closure.  The final map is still rebuilt from the optimized poses at
+        shutdown; this provisional pose is only for a live Gaussian snapshot.
+        """
+        backend_id = keyframe.get_id() + 1
+        pose_matrix = None
+        try:
+            pose_matrix = self._backend.get_pose_at_keyframe(backend_id)
+        except Exception:
+            pose_matrix = None
+
+        if pose_matrix is None:
+            # The first estimate may not have been published yet.  A
+            # non-blocking timestamp query is a useful fallback and keeps the
+            # tracker on its real-time path.
+            try:
+                timestamp = keyframe._associated_imu_timestamp or keyframe.get_time()
+                pose_matrix = self._backend.get_pose_at_time(timestamp, block=False)
+            except Exception:
+                pose_matrix = None
+
+        if pose_matrix is None:
+            return
+        if hasattr(pose_matrix, "get_transformation_matrix"):
+            pose_matrix = pose_matrix.get_transformation_matrix()
+        if isinstance(pose_matrix, torch.Tensor):
+            pose_tensor = pose_matrix.detach().cpu().float()
+        else:
+            pose_tensor = torch.as_tensor(np.asarray(pose_matrix), dtype=torch.float32)
+        if pose_tensor.shape == (4, 4) and torch.isfinite(pose_tensor).all():
+            keyframe._camera_pose = Pose(pose_tensor, fixed=True)
+
     def save_backend_traj(self, fname):
         os.makedirs(os.path.dirname(fname), exist_ok=True)
         self._backend.save_traj(fname)
@@ -206,6 +241,7 @@ class Tracker:
             keyframe._id = self._frame_count
             self._frame_count += 1
 
+            self._attach_provisional_pose(keyframe)
             self._keyframe_signal.emit(keyframe.clone())
             self._keyframes[keyframe.get_id()] = keyframe
             self._kf_stereo_to_imu_lookup[keyframe.get_id()] = keyframe._associated_imu_timestamp

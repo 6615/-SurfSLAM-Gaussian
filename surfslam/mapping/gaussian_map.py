@@ -350,6 +350,10 @@ class GaussianMapWriter:
             "count": int(len(gaussian_params["xyz"])),
             "ply_path": ply_path,
             "npz_path": npz_path,
+            # Online mode uses the reduced representation as its next bounded
+            # accumulator instead of retaining every raw depth pixel forever.
+            "points": gaussian_params["xyz"],
+            "colors": gaussian_params["colors"],
         }
 
 

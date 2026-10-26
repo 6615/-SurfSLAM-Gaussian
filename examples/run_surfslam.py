@@ -351,6 +351,12 @@ if __name__ == "__main__":
         default=None,
         help="Map representation written at shutdown (default: config value).",
     )
+    parser.add_argument(
+        "--gaussian_mode",
+        choices=("final", "online"),
+        default=None,
+        help="Gaussian output mode: final map only or provisional online snapshots.",
+    )
 
     args = parser.parse_args()
 
@@ -400,6 +406,8 @@ if __name__ == "__main__":
             _settings.system.log_dir_prefix = args.log_dir_root
         if args.map_type is not None:
             _settings.mapper.map_type = args.map_type
+        if args.gaussian_mode is not None:
+            _settings.mapper.gaussian.mode = args.gaussian_mode
 
     failed_trials = []
 

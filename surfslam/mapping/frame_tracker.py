@@ -5,7 +5,8 @@ FrameTracker: A lightweight alternative to Mapper that defers pose association.
 
 This class:
 1. Receives completed frames one at a time and immediately stores depth/color to CPU
-2. At the end of the run, receives final optimized poses and accumulates point clouds
+2. At the end of the run, receives final optimized poses and accumulates maps
+3. Optionally publishes provisional Gaussian snapshots while keyframes arrive
 
 Copyright 2023, Ford Center for Autonomous Vehicles at University of Michigan
 All Rights Reserved.
@@ -153,7 +154,8 @@ class FrameTracker:
     This class:
     - Receives one frame at a time and immediately moves depth/color to CPU
     - Stores minimal data indexed by keyframe ID
-    - At shutdown, receives final poses and accumulates point clouds
+    - At shutdown, receives final poses and accumulates the selected map
+    - Optionally publishes provisional Gaussian snapshots from current poses
     """
 
     def __init__(
@@ -183,9 +185,25 @@ class FrameTracker:
                 "mapper.map_type must be either 'pointcloud' or 'gaussian', "
                 f"got {self._map_type!r}"
             )
-        self._gaussian_writer = GaussianMapWriter(
-            self._settings.mapper.get("gaussian", {})
+        self._gaussian_config = self._settings.mapper.get("gaussian", {})
+        self._gaussian_mode = str(
+            self._gaussian_config.get("mode", "final")
+        ).lower()
+        if self._gaussian_mode not in {"final", "online"}:
+            raise ValueError(
+                "mapper.gaussian.mode must be either 'final' or 'online', "
+                f"got {self._gaussian_mode!r}"
+            )
+        self._gaussian_writer = GaussianMapWriter(self._gaussian_config)
+        self._online_gaussian_enabled = (
+            self._map_type == "gaussian" and self._gaussian_mode == "online"
         )
+        self._online_update_interval = max(
+            1, int(self._gaussian_config.get("online_update_interval_keyframes", 5))
+        )
+        self._online_gaussian_points = []
+        self._online_gaussian_colors = []
+        self._online_gaussian_keyframes = 0
 
         self._final_poses_slot: Slot = final_poses_signal.register()
         self._completed_frame_slot: Slot = completed_frame_signal.register()
@@ -245,6 +263,9 @@ class FrameTracker:
         """Initialize the frame tracker."""
         print("FrameTracker spawned and started.")
         self._keyframe_data = {}
+        self._online_gaussian_points = []
+        self._online_gaussian_colors = []
+        self._online_gaussian_keyframes = 0
 
     def _find_closest_reading(self, target_timestamp: float, buffer: list, key: str = None) -> Optional[dict]:
         """Find the reading in buffer closest to target_timestamp."""
@@ -293,7 +314,102 @@ class FrameTracker:
             "barometer": closest_baro,
             "imu": closest_imu,
         }
+
+        if self._online_gaussian_enabled:
+            try:
+                self._update_online_gaussian_map(
+                    completed_frame, self._keyframe_data[keyframe_id]
+                )
+            except Exception as exc:
+                # A provisional visualization must never take down the SLAM
+                # pipeline.  The final Gaussian/point-cloud export remains
+                # available because the raw keyframe was already stored.
+                print(f"FrameTracker: disabling online Gaussian map: {exc}")
+                self._online_gaussian_enabled = False
         return True
+
+    def _update_online_gaussian_map(
+        self, completed_frame: Frame, data: Dict[str, Any]
+    ) -> None:
+        """Add one keyframe using its provisional pose and publish snapshots.
+
+        The pose is attached by ``Tracker`` before the frame is sent through
+        the stereo/depth pipeline.  Loop closures can revise it later, so this
+        provisional map is for live visualization; ``stop()`` still rebuilds
+        the final map from optimized poses.
+        """
+        camera_pose = completed_frame.get_camera_pose()
+        if camera_pose is None:
+            return
+
+        world_T_cam = camera_pose.get_transformation_matrix().detach().cpu().numpy()
+        intrinsics: torch.Tensor = self._settings.calibration["camera_intrinsic"]["k"]
+        depth_image = data["depth_image"].cuda()
+        color_image = (
+            data["color_image"].cuda()
+            if data["color_image"] is not None
+            else None
+        )
+        pc_cam, pc_color = self._get_pc(depth_image, intrinsics, color_image)
+        pc_cam_np = pc_cam.cpu().numpy()
+
+        if self._enable_water_filtering:
+            baro_data = data.get("barometer")
+            imu_data = data.get("imu")
+            if baro_data is not None and imu_data is not None:
+                water_surface = estimate_water_surface_plane_in_camera(
+                    baro_data,
+                    imu_data,
+                    world_T_cam,
+                    surface_threshold=self._water_surface_threshold,
+                    pressure_units="hpa",
+                )
+                if water_surface is not None:
+                    valid_mask = filter_points_above_water(
+                        pc_cam_np, world_T_cam, water_surface
+                    )
+                    pc_cam_np = pc_cam_np[valid_mask]
+                    if pc_color is not None:
+                        pc_color = torch.from_numpy(pc_color.cpu().numpy()[valid_mask])
+
+        if pc_cam_np.size == 0:
+            return
+
+        pc_world_np = self._se3_apply_to_points(world_T_cam, pc_cam_np)
+        if pc_color is None:
+            colors_np = np.tile(
+                np.array([[0.5, 0.5, 0.5]], dtype=np.float32),
+                (pc_world_np.shape[0], 1),
+            )
+        else:
+            colors_np = pc_color.cpu().float().numpy() / 255.0
+
+        self._online_gaussian_points.append(pc_world_np)
+        self._online_gaussian_colors.append(colors_np)
+        self._online_gaussian_keyframes += 1
+
+        if self._online_gaussian_keyframes % self._online_update_interval != 0:
+            return
+
+        self._write_online_gaussian_map()
+
+    def _write_online_gaussian_map(self) -> None:
+        if not self._online_gaussian_points:
+            return
+
+        points = np.vstack(self._online_gaussian_points)
+        colors = np.vstack(self._online_gaussian_colors)
+        output_path = Path(self._settings.log_directory) / "reconstructed_gaussians_live.ply"
+        result = self._gaussian_writer.write(output_path, points, colors)
+
+        # Keep the already reduced map as the next accumulator so online
+        # memory stays bounded by max_gaussians rather than raw pixels.
+        self._online_gaussian_points = [result["points"]]
+        self._online_gaussian_colors = [result["colors"]]
+        print(
+            f"FrameTracker: Online Gaussian snapshot with {result['count']} "
+            f"primitives -> {result['ply_path']}"
+        )
 
     def update(self):
         """Process incoming frames and backend data."""
@@ -405,6 +521,11 @@ class FrameTracker:
         
         if final_poses:
             output_dir = Path(self._settings.log_directory)
+            if self._online_gaussian_enabled and self._online_gaussian_points:
+                try:
+                    self._write_online_gaussian_map()
+                except Exception as exc:
+                    print(f"FrameTracker: final online Gaussian snapshot failed: {exc}")
             if self._map_type == "gaussian":
                 output_path = output_dir / "reconstructed_gaussians.ply"
             else:

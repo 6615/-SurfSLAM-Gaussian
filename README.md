@@ -112,6 +112,8 @@ sequence configuration (or to an overrides YAML):
 mapper:
   map_type: gaussian
   gaussian:
+    mode: final  # use online for provisional snapshots while running
+    online_update_interval_keyframes: 5
     voxel_size: 0.03
     max_gaussians: 500000
     opacity: 0.8
@@ -125,15 +127,27 @@ For a one-off run, the same choice can be made without editing YAML:
 python examples/run_surfslam.py cfg/tbnms/monohansett_long.yaml --map_type gaussian
 ```
 
+To also publish provisional Gaussian snapshots while keyframes arrive, use:
+
+```bash
+python examples/run_surfslam.py cfg/tbnms/monohansett_long.yaml \
+  --map_type gaussian --gaussian_mode online
+```
+
+Online snapshots are written to `reconstructed_gaussians_live.ply/.npz` using
+the current pose estimate. Loop closures can move older Gaussians, so the
+final `reconstructed_gaussians.ply/.npz` is rebuilt at shutdown with optimized
+poses.
+
 The tracking, stereo-depth, registration, and pose-graph paths are unchanged.
 At shutdown, the Gaussian option reuses the same final keyframe poses, depth,
 RGB data, and water-surface filtering as the point-cloud option. It writes
 `reconstructed_gaussians.ply` and a matching `reconstructed_gaussians.npz` in
 the run directory. The PLY uses the common 3D Gaussian Splatting fields
 (`xyz`, SH coefficients, opacity, log-scales, and quaternion rotations), so it
-can be passed to a compatible Gaussian renderer or optimizer later. The first
-version is an export-time initialization; it does not add a differentiable
-Gaussian optimizer to the real-time tracking path.
+can be passed to a compatible Gaussian renderer or optimizer later. The
+Gaussian path does not add a differentiable Gaussian optimizer to the
+real-time tracking path.
 
 ## Computing Metrics
 
