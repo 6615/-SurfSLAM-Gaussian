@@ -102,6 +102,39 @@ To rebuild a dense map offline from a finished run's trajectory:
 python examples/offline_mapping.py cfg/tbnms/mono_long.yaml outputs/<run_dir> --output_mesh mesh.ply
 ```
 
+### Selecting the map representation
+
+SurfSLAM keeps the original point-cloud map by default. To export a
+3D-Gaussian-compatible map instead, add this to the `changes` section of a
+sequence configuration (or to an overrides YAML):
+
+```yaml
+mapper:
+  map_type: gaussian
+  gaussian:
+    voxel_size: 0.03
+    max_gaussians: 500000
+    opacity: 0.8
+    scale_multiplier: 1.0
+    sh_degree: 0
+```
+
+For a one-off run, the same choice can be made without editing YAML:
+
+```bash
+python examples/run_surfslam.py cfg/tbnms/monohansett_long.yaml --map_type gaussian
+```
+
+The tracking, stereo-depth, registration, and pose-graph paths are unchanged.
+At shutdown, the Gaussian option reuses the same final keyframe poses, depth,
+RGB data, and water-surface filtering as the point-cloud option. It writes
+`reconstructed_gaussians.ply` and a matching `reconstructed_gaussians.npz` in
+the run directory. The PLY uses the common 3D Gaussian Splatting fields
+(`xyz`, SH coefficients, opacity, log-scales, and quaternion rotations), so it
+can be passed to a compatible Gaussian renderer or optimizer later. The first
+version is an export-time initialization; it does not add a differentiable
+Gaussian optimizer to the real-time tracking path.
+
 ## Computing Metrics
 
 By default, trajectory evaluation picks up every run of our method found in `outputs/` and compares it against the released ground-truth trajectories -- no configuration needed. To evaluate other methods side by side, add entries to the `algorithms` list in [analysis/traj_eval_cfg.yaml](analysis/traj_eval_cfg.yaml).

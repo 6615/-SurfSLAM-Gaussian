@@ -65,6 +65,18 @@ mapper:
   device: 0 # don't change this, use CUDA_VISIBLE_DEVICES
   data_prep_on_cpu: &data_prep_on_cpu False
 
+  # Map representation written when the run finishes.  The default keeps the
+  # original Open3D point-cloud output.  Set to "gaussian" to export a
+  # 3D-Gaussian-compatible PLY/NPZ from the same keyframes and optimized poses.
+  # This switch does not change tracking, registration, or pose-graph behavior.
+  map_type: pointcloud
+  gaussian:
+    voxel_size: 0.03
+    max_gaussians: 500000
+    opacity: 0.8
+    scale_multiplier: 1.0
+    sh_degree: 0
+
   # Water surface filtering settings
   enable_water_surface_filtering: True
   water_surface_threshold: 0.5  # meters below surface to filter

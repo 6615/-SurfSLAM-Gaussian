@@ -27,6 +27,7 @@ from common.signals import Signal, Slot, StopSignal
 from common.shared_state import SharedState
 
 from mapping.pointcloud_registration.pointcloud_cleaner import GPUPointCloudCleaner
+from mapping.gaussian_map import GaussianMapWriter
 
 
 def _extract_frame_stereo_timestamp(frame_item: Frame) -> float:
@@ -171,6 +172,20 @@ class FrameTracker:
             backend_to_mapper_signal: Signal to receive latest backend measurements (IMU, DVL, Barometer)
         """
         self._settings = settings
+
+        # Keep the existing point-cloud output as the default.  Gaussian maps
+        # reuse the same keyframes, depth, colors, and optimized poses, so the
+        # representation can be selected without changing the SLAM frontend or
+        # pose-graph backend.
+        self._map_type = str(self._settings.mapper.get("map_type", "pointcloud")).lower()
+        if self._map_type not in {"pointcloud", "gaussian"}:
+            raise ValueError(
+                "mapper.map_type must be either 'pointcloud' or 'gaussian', "
+                f"got {self._map_type!r}"
+            )
+        self._gaussian_writer = GaussianMapWriter(
+            self._settings.mapper.get("gaussian", {})
+        )
 
         self._final_poses_slot: Slot = final_poses_signal.register()
         self._completed_frame_slot: Slot = completed_frame_signal.register()
@@ -390,8 +405,12 @@ class FrameTracker:
         
         if final_poses:
             output_dir = Path(self._settings.log_directory)
-            self.save_map(str(output_dir / "reconstructed_map.ply"), final_poses)
-            print(f"Saved reconstructed map to {output_dir / 'reconstructed_map.ply'}.")
+            if self._map_type == "gaussian":
+                output_path = output_dir / "reconstructed_gaussians.ply"
+            else:
+                output_path = output_dir / "reconstructed_map.ply"
+            self.save_map(str(output_path), final_poses)
+            print(f"Saved {self._map_type} map to {output_path}.")
         else:
             print("FrameTracker: No poses received, cannot save map.")
         
@@ -413,7 +432,7 @@ class FrameTracker:
 
     def save_map(self, filepath: str, final_poses: Dict[int, np.ndarray]) -> None:
         """
-        Save the reconstructed point cloud to disk.
+        Save the selected map representation to disk.
         
         This is where the final pose association happens:
         1. For each keyframe, get its pose and depth image
@@ -424,29 +443,57 @@ class FrameTracker:
             filepath: Path to save the point cloud
             final_poses: Dict of {keyframe_id: 4x4 numpy pose matrix}
         """
-        if not self._keyframe_data:
-            print("FrameTracker: No keyframe data to save.")
+        aggregated_points, aggregated_colors = self._accumulate_world_points(final_poses)
+        if aggregated_points is None:
             return
 
-        print(f"FrameTracker: Accumulating point cloud from {len(self._keyframe_data)} keyframes...")
+        if self._map_type == "gaussian":
+            result = self._gaussian_writer.write(
+                filepath,
+                aggregated_points,
+                aggregated_colors,
+            )
+            print(
+                f"FrameTracker: Saved {result['count']} Gaussian primitives to "
+                f"{result['ply_path']} (parameters: {result['npz_path']})."
+            )
+            return
+
+        # Create Open3D point cloud and save
+        pc_o3d = o3d.geometry.PointCloud()
+        pc_o3d.points = o3d.utility.Vector3dVector(aggregated_points)
+        pc_o3d.colors = o3d.utility.Vector3dVector(aggregated_colors)
+
+        o3d.io.write_point_cloud(filepath, pc_o3d)
+        print(f"FrameTracker: Saved {aggregated_points.shape[0]} points to {filepath}.")
+
+    def _accumulate_world_points(
+        self, final_poses: Dict[int, np.ndarray]
+    ) -> tuple:
+        """Build the world-frame RGB point set shared by both map backends."""
+        if not self._keyframe_data:
+            print("FrameTracker: No keyframe data to save.")
+            return None, None
+
+        print(
+            f"FrameTracker: Accumulating map from {len(self._keyframe_data)} keyframes..."
+        )
         print(f"FrameTracker: Have {len(final_poses)} poses available.")
 
         intrinsics: torch.Tensor = self._settings.calibration["camera_intrinsic"]["k"]
-
         all_points = []
         all_colors = []
-        
         processed_count = 0
         skipped_count = 0
-        
 
         for keyframe_id, data in sorted(self._keyframe_data.items()):
-            # keyframe IDs in Python are 0-indexed, but the backend uses 1-indexed keyframes
-            # (the first keyframe created by IMU is x0, first stereo keyframe is x1)
+            # Python keyframe IDs are 0-indexed; the backend uses 1-indexed IDs.
             backend_kf_id = keyframe_id + 1
-
             if backend_kf_id not in final_poses:
-                print(f"FrameTracker: No pose for keyframe {keyframe_id} (backend ID {backend_kf_id}), skipping.")
+                print(
+                    f"FrameTracker: No pose for keyframe {keyframe_id} "
+                    f"(backend ID {backend_kf_id}), skipping."
+                )
                 skipped_count += 1
                 continue
 
@@ -457,19 +504,17 @@ class FrameTracker:
                 continue
 
             depth_image = data["depth_image"].cuda()
-            color_image = data["color_image"].cuda() if data["color_image"] is not None else None
-
-            # Get point cloud in camera frame
+            color_image = (
+                data["color_image"].cuda()
+                if data["color_image"] is not None
+                else None
+            )
             pc_cam, pc_color = self._get_pc(depth_image, intrinsics, color_image)
-            
-            # Convert to numpy for filtering
             pc_cam_np = pc_cam.cpu().numpy()
-            
-            # Apply water surface filtering if enabled
+
             if self._enable_water_filtering:
                 baro_data = data.get("barometer")
                 imu_data = data.get("imu")
-                
                 if baro_data is not None and imu_data is not None:
                     water_surface = estimate_water_surface_plane_in_camera(
                         baro_data,
@@ -478,48 +523,40 @@ class FrameTracker:
                         surface_threshold=self._water_surface_threshold,
                         pressure_units="hpa",
                     )
-                    
                     if water_surface is not None:
                         points_before = len(pc_cam_np)
-                        valid_mask = filter_points_above_water(pc_cam_np, world_T_cam, water_surface)
+                        valid_mask = filter_points_above_water(
+                            pc_cam_np, world_T_cam, water_surface
+                        )
                         points_below = np.sum(valid_mask)
                         points_above = points_before - points_below
-                        
-                        print(f"Frame {keyframe_id}: {points_before} points total, "
-                              f"{points_above} above water ({100*points_above/points_before:.1f}%), "
-                              f"{points_below} below water ({100*points_below/points_before:.1f}%)")
-                        
+                        ratio = 100 * points_above / max(points_before, 1)
+                        print(
+                            f"Frame {keyframe_id}: {points_before} points total, "
+                            f"{points_above} above water ({ratio:.1f}%), "
+                            f"{points_below} below water."
+                        )
                         pc_cam_np = pc_cam_np[valid_mask]
-                        
                         if pc_color is not None:
-                            pc_color_np = pc_color.cpu().numpy()
-                            pc_color_np = pc_color_np[valid_mask]
+                            pc_color_np = pc_color.cpu().numpy()[valid_mask]
                             pc_color = torch.from_numpy(pc_color_np)
-            
-            # Transform to world frame
-            pc_world_np = self._se3_apply_to_points(world_T_cam, pc_cam_np)
 
+            if pc_cam_np.size == 0:
+                continue
+
+            pc_world_np = self._se3_apply_to_points(world_T_cam, pc_cam_np)
             all_points.append(pc_world_np)
             if pc_color is not None:
-                all_colors.append(pc_color.cpu().float().numpy() / 255)
+                all_colors.append(pc_color.cpu().float().numpy() / 255.0)
             else:
-                all_colors.append(np.tile(np.array([[0.5, 0.5, 0.5]]), (pc_cam_np.shape[0], 1)))
-
+                all_colors.append(
+                    np.tile(np.array([[0.5, 0.5, 0.5]]), (pc_cam_np.shape[0], 1))
+                )
             processed_count += 1
 
         print(f"FrameTracker: Processed {processed_count} keyframes, skipped {skipped_count}")
-
         if not all_points:
             print("FrameTracker: No points accumulated, nothing to save.")
-            return
+            return None, None
 
-        aggregated_points = np.vstack(all_points)
-        aggregated_colors = np.vstack(all_colors)
-
-        # Create Open3D point cloud and save
-        pc_o3d = o3d.geometry.PointCloud()
-        pc_o3d.points = o3d.utility.Vector3dVector(aggregated_points)
-        pc_o3d.colors = o3d.utility.Vector3dVector(aggregated_colors)
-
-        o3d.io.write_point_cloud(filepath, pc_o3d)
-        print(f"FrameTracker: Saved {aggregated_points.shape[0]} points to {filepath}.")
+        return np.vstack(all_points), np.vstack(all_colors)

@@ -345,6 +345,12 @@ if __name__ == "__main__":
                         help="Set system.log_dir_prefix outright (overriding the config's own), so every "
                              "config in a sweep arm lands in the same tree")
     parser.add_argument("--maxrange", type=float, default=None, help="if set, overrides ray_range[1]")
+    parser.add_argument(
+        "--map_type",
+        choices=("pointcloud", "gaussian"),
+        default=None,
+        help="Map representation written at shutdown (default: config value).",
+    )
 
     args = parser.parse_args()
 
@@ -392,6 +398,8 @@ if __name__ == "__main__":
             _settings.tracker.traj_pose_queue_max_size = args.traj_queue_size
         if args.log_dir_root is not None:
             _settings.system.log_dir_prefix = args.log_dir_root
+        if args.map_type is not None:
+            _settings.mapper.map_type = args.map_type
 
     failed_trials = []
 

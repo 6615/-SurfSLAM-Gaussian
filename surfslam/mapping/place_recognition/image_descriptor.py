@@ -20,7 +20,17 @@ class ImageDescriptorManager:
                     
     def _build_faiss_index(self):
         """Build FAISS index for fast nearest neighbor search."""
-        if self.device is not None and self.device.type == 'cuda':
+        # The host setup ships the CPU FAISS wheel because the machine's
+        # CUDA/Torch runtime is already pinned independently.  Keep the CUDA
+        # path when a GPU-enabled FAISS build is present, but fall back to the
+        # equivalent CPU index when it is not.
+        use_gpu = (
+            self.device is not None
+            and self.device.type == 'cuda'
+            and hasattr(faiss, 'StandardGpuResources')
+            and hasattr(faiss, 'GpuIndexFlatL2')
+        )
+        if use_gpu:
             res = faiss.StandardGpuResources()
             self.faiss_index = faiss.GpuIndexFlatL2(res, self.descriptor_dim)
         else:
@@ -37,7 +47,12 @@ class ImageDescriptorManager:
             all_desc = all_desc[indices]
             
         all_desc = np.ascontiguousarray(all_desc.astype(np.float32))
-        use_gpu = self.device is not None and self.device.type == 'cuda'
+        use_gpu = (
+            self.device is not None
+            and self.device.type == 'cuda'
+            and hasattr(faiss, 'StandardGpuResources')
+            and hasattr(faiss, 'Kmeans')
+        )
         
         print(f"Fitting VLAD with {len(all_desc)} descriptors, {self.n_clusters} clusters (GPU={use_gpu})...")
         max_points = int(len(all_desc) / self.n_clusters * 1.5)  # Add some headroom
